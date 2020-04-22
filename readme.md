@@ -1,4 +1,4 @@
-# Truly Proximal Policy Optimization
+# Truly Proximal Policy Optimization (Truly PPO)
 
 # Requirements
 - Pytorch
