@@ -8,14 +8,21 @@ import datetime
 from torch.utils.tensorboard import SummaryWriter
 from model import Model
 
-T_HORIZON       = 32
+T_HORIZON       = 128
 N_MINIBATCH     = 1
-LEARNING_RATE   = 5e-5
+LEARNING_RATE   = 5e-4
 EPS             = 0.2
-N_EPOCH         = 20
+N_EPOCH         = 5
 
 GAMMA           = 0.99
 LAMBDA          = 0.95
+
+TYPE_PPO        = 0
+TYPE_ROLLBACK   = 1
+TYPE_TR         = 2
+TYPE_TRULY      = 3
+PPO_TYPE        = TYPE_PPO
+
 
 def compute_gae(rewards, values, values_n, dones):
     td_target = rewards + GAMMA * values_n * (1 - dones)
@@ -29,85 +36,93 @@ def compute_gae(rewards, values, values_n, dones):
 def train_step(model, states, actions, probs, rewards, dones, statesn):
     device = model.getdevice()
 
-    # compute return and advantages
-    values = model.values(states)
-    valuesn = model.values(statesn)
-    advs, returns = compute_gae(rewards, values, valuesn, dones)
-    
-    # advs = returns - values
+    states = np.split(states, N_MINIBATCH)
+    actions = np.split(actions, N_MINIBATCH)
+    probs = np.split(probs, N_MINIBATCH)
+    rewards = np.split(rewards, N_MINIBATCH)
+    dones = np.split(dones, N_MINIBATCH)
+    statesn = np.split(statesn, N_MINIBATCH)
 
-    # # Normalize the advantages
-    # advs = (advs - advs.mean()) / (advs.std() + 1e-8)
+    losses = []
+    losses_p = []
+    losses_v = []
+    for i in range(N_MINIBATCH):
+        values = model.values(states[i])
+        valuesn = model.values(statesn[i])
+        advs, returns = compute_gae(rewards[i], values, valuesn, dones[i])
 
-    # convert from numpy to tensors
-    states = torch.tensor(states.copy(), device=device).float()
-    actions = torch.tensor(actions.copy(), device=device).long()
-    probs = torch.tensor(probs.copy(), device=device).float()
-    advs = torch.tensor(advs.copy(), device=device).float()
-    returns = torch.tensor(returns.copy(), device=device).float()
-    values = torch.tensor(values.copy(), device=device).float()
+        states[i] = torch.tensor(states[i].copy(), device=device).float()
+        actions[i] = torch.tensor(actions[i].copy(), device=device).long()[:, None]
+        probs[i] = torch.tensor(probs[i].copy(), device=device).float()[:, None]
+        advs = torch.tensor(advs.copy(), device=device).float()[:, None]
+        returns = torch.tensor(returns.copy(), device=device).float()[:, None]
+        values = torch.tensor(values.copy(), device=device).float()[:, None]
 
-    # reshape the data
-    actions = actions[:, None]
-    probs = probs[:, None]
-    advs = advs[:, None]
-    returns = returns[:, None]
-    values = values[:, None]
+        # compute gradient and updates
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        optimizer.zero_grad()
+        ppreds, vpreds = model(states[i])
+        loss_policy = loss_policy_fn(ppreds, actions[i], probs[i], advs)
+        loss_value = loss_value_fn(vpreds, returns, values)
+        vf_coef = 0.5
 
-    # compute gradient and updates
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    optimizer.zero_grad()
-    ppreds, vpreds = model(states)
-    loss_policy = loss_policy_fn(ppreds, actions, probs, advs)
-    loss_value = loss_value_fn(vpreds, returns, values)
-    vf_coef = 0.5
+        entropy = torch.distributions.Categorical(probs=ppreds)
+        entropy = entropy.entropy().mean()
 
-    loss = (loss_policy) + (vf_coef * loss_value)
-    loss.backward()
-    optimizer.step()
+        loss = (loss_policy) + (vf_coef * loss_value) + (- 0.01 * entropy)
+        loss.backward()
+        optimizer.step()
 
-    return loss.detach().cpu().numpy(), loss_policy.detach().cpu().numpy(), loss_value.detach().cpu().numpy()
+        losses.append(loss.item())
+        losses_p.append(loss_policy.item())
+        losses_v.append(loss_value.item())
+
+    return np.mean(losses), np.mean(losses_p), np.mean(losses_v)
 
 def loss_policy_fn(preds, actions, oldprobs, advs):
-    """
-    preds = (batch_size, action_size)
-    actions = (batch_size, 1)
-    oldprobs = (batch_size, 1)
-    advs = (batch_size, 1)
-    """
     probs = torch.gather(preds, dim=-1, index=actions)
     ratio = torch.exp(torch.log(probs) - torch.log(oldprobs))
-    surr1 = ratio * advs
-    surr2 = torch.clamp(ratio, 1 - EPS, 1 + EPS) * advs
 
-    loss = -torch.min(surr1, surr2)
+    if PPO_TYPE == TYPE_PPO:
+        surr1 = ratio * advs
+        surr2 = torch.clamp(ratio, 1 - EPS, 1 + EPS) * advs
+        loss = -torch.min(surr1, surr2)
+    elif PPO_TYPE == TYPE_ROLLBACK:
+        slope = -0.3
+        pg_targets = torch.where(advs >= 0,
+            torch.where(ratio <= 1 + EPS, ratio, slope * ratio + (1 - slope) * (1 + EPS)),
+            torch.where(ratio >= 1 - EPS, ratio, slope * ratio + (1 - slope) * (1 - EPS))
+        ) * advs
+        loss = -pg_targets
+
     return loss.mean()
 
 def loss_value_fn(preds, returns, oldvpred):
     vpredclipped = oldvpred + torch.clamp(preds - oldvpred, -EPS, EPS)
-    vf_losses1 = (preds - returns) ** 2
-    vf_losses2 = (vpredclipped - returns) ** 2
+    vf_losses1 = F.smooth_l1_loss(preds, returns)
+    vf_losses2 = F.smooth_l1_loss(vpredclipped, returns)
 
-    loss = .5 * torch.max(vf_losses1, vf_losses2).mean()
-    return loss.mean()
+    # loss = .5 * torch.max(vf_losses1, vf_losses2).mean()
+    loss = vf_losses1
+    return loss
 
 def test_model(model):
     model.eval()
     env = gym.make('CartPole-v1')
 
-    score = [0.]
+    score = []
 
-    for _ in range(20):
+    for _ in range(10):
         s = env.reset()
+        score.append(0.)
         while True:
             a = model.action(s)
             s, r, d, _ = env.step(a)
             score[-1] += r
             if d:
-                score.append(0.)
                 break
 
-    return np.mean(score)
+    return sum(score)/len(score)
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -132,12 +147,12 @@ if __name__ == '__main__':
     entropy = np.empty((T_HORIZON,))
 
     num_updates = 0
-    epi_rewards = [0.]
+    epi_rewards = []
     interval = 20
 
     sn = env.reset()
     while True:
-
+        epi_rewards.append(0.)
         for t in range(T_HORIZON):
             states[t] = sn.copy()
             actions[t], probs[t], entropy[t] = model.action_sample(states[t])
@@ -151,9 +166,10 @@ if __name__ == '__main__':
                 statesn[t] = sn.copy()
 
                 train_summary_writer.add_scalar('train_epi_rewards', epi_rewards[-1], num_updates)
-                epi_rewards.append(0.)
 
         # train
+        model.train()
+
         losses = []
         losses_actor = []
         losses_critic = []
@@ -174,7 +190,7 @@ if __name__ == '__main__':
         if num_updates % interval == 0:
             print("num_epi = {}, num_updates = {} test score = {}".format(len(epi_rewards), num_updates, score))
 
-        if np.mean(epi_rewards[-5:]) == 500.0:
+        if score == 500.0:
             break
 
     train_summary_writer.close()
