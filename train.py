@@ -17,11 +17,16 @@ N_EPOCH         = 5
 GAMMA           = 0.99
 LAMBDA          = 0.95
 
+VF_COEF         = 0.5
+ENT_COEF        = 0.01
+
+KLRANGE         = 0.001
+
 TYPE_PPO        = 0
 TYPE_ROLLBACK   = 1
 TYPE_TR         = 2
 TYPE_TRULY      = 3
-PPO_TYPE        = TYPE_PPO
+PPO_TYPE        = TYPE_TRULY
 
 
 def compute_gae(rewards, values, values_n, dones):
@@ -67,9 +72,9 @@ def train_step(model, states, actions, probs, rewards, dones, statesn):
         vf_coef = 0.5
 
         entropy = torch.distributions.Categorical(probs=ppreds)
-        entropy = entropy.entropy().mean()
+        entropy = -entropy.entropy().mean()
 
-        loss = (loss_policy) + (vf_coef * loss_value) + (- 0.01 * entropy)
+        loss = (loss_policy) + (VF_COEF * loss_value) + (ENT_COEF * entropy)
         loss.backward()
         optimizer.step()
 
@@ -82,18 +87,52 @@ def train_step(model, states, actions, probs, rewards, dones, statesn):
 def loss_policy_fn(preds, actions, oldprobs, advs):
     probs = torch.gather(preds, dim=-1, index=actions)
     ratio = torch.exp(torch.log(probs) - torch.log(oldprobs))
+    kl = F.kl_div(oldprobs, probs, reduction='none')
 
     if PPO_TYPE == TYPE_PPO:
         surr1 = ratio * advs
         surr2 = torch.clamp(ratio, 1 - EPS, 1 + EPS) * advs
         loss = -torch.min(surr1, surr2)
+
     elif PPO_TYPE == TYPE_ROLLBACK:
-        slope = -0.3
-        pg_targets = torch.where(advs >= 0,
-            torch.where(ratio <= 1 + EPS, ratio, slope * ratio + (1 - slope) * (1 + EPS)),
-            torch.where(ratio >= 1 - EPS, ratio, slope * ratio + (1 - slope) * (1 - EPS))
+        ALPHA = 0.3
+    
+        pgloss1 = ratio * advs
+        pgloss2 = torch.where(
+            ratio <= 1 - EPS,
+            -ALPHA * ratio + (1 + ALPHA) * (1 - EPS),
+            torch.where(
+                ratio >= 1 + EPS,
+                -ALPHA * ratio + (1 + ALPHA) * (1 - EPS),
+                ratio
+            )
         ) * advs
-        loss = -pg_targets
+
+        loss = -torch.min(pgloss1, pgloss2)
+
+    elif PPO_TYPE == TYPE_TR:
+        DELTA = 0.03
+
+        pgloss1 = ratio * advs
+        pgloss2 = torch.where(
+            kl >= DELTA,
+            torch.tensor(1.),
+            ratio
+        ) * advs
+
+        loss = -torch.min(pgloss1, pgloss2)
+
+    elif PPO_TYPE == TYPE_TRULY:
+        ALPHA = 5
+        DELTA = 0.05
+
+        pgloss1 = ratio * advs
+        pgloss2 = torch.where(
+            (kl >= DELTA) & (ratio * advs >= advs),
+            ALPHA * kl,
+            torch.tensor(DELTA)
+        )
+        loss = -(pgloss1 - pgloss2)
 
     return loss.mean()
 
@@ -102,7 +141,7 @@ def loss_value_fn(preds, returns, oldvpred):
     vf_losses1 = F.smooth_l1_loss(preds, returns)
     vf_losses2 = F.smooth_l1_loss(vpredclipped, returns)
 
-    # loss = .5 * torch.max(vf_losses1, vf_losses2).mean()
+    loss = .5 * torch.max(vf_losses1, vf_losses2).mean()
     loss = vf_losses1
     return loss
 
@@ -147,12 +186,11 @@ if __name__ == '__main__':
     entropy = np.empty((T_HORIZON,))
 
     num_updates = 0
-    epi_rewards = []
+    epi_rewards = [0.]
     interval = 20
 
     sn = env.reset()
     while True:
-        epi_rewards.append(0.)
         for t in range(T_HORIZON):
             states[t] = sn.copy()
             actions[t], probs[t], entropy[t] = model.action_sample(states[t])
@@ -164,8 +202,8 @@ if __name__ == '__main__':
             if dones[t]:
                 sn = env.reset()
                 statesn[t] = sn.copy()
-
                 train_summary_writer.add_scalar('train_epi_rewards', epi_rewards[-1], num_updates)
+                epi_rewards.append(0.)
 
         # train
         model.train()
@@ -190,7 +228,7 @@ if __name__ == '__main__':
         if num_updates % interval == 0:
             print("num_epi = {}, num_updates = {} test score = {}".format(len(epi_rewards), num_updates, score))
 
-        if score == 500.0:
-            break
+        # if score == 500.0:
+        #     break
 
     train_summary_writer.close()
