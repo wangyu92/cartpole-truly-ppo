@@ -116,7 +116,7 @@ def loss_policy_fn(preds, actions, oldprobs, advs):
         pgloss1 = ratio * advs
         pgloss2 = torch.where(
             kl >= DELTA,
-            torch.tensor(1.),
+            torch.tensor(1., device=ratio.device),
             ratio
         ) * advs
 
@@ -130,7 +130,7 @@ def loss_policy_fn(preds, actions, oldprobs, advs):
         pgloss2 = torch.where(
             (kl >= DELTA) & (ratio * advs >= advs),
             ALPHA * kl,
-            torch.tensor(DELTA)
+            torch.tensor(DELTA, device=ratio.device)
         )
         loss = -(pgloss1 - pgloss2)
 
